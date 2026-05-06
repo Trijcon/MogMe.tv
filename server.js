@@ -1,27 +1,52 @@
-const express    = require('express');
+const express = require('express');
 const { WebSocketServer, WebSocket } = require('ws');
 const { v4: uuidv4 } = require('uuid');
-const cors       = require('cors');
-const http       = require('http');
+const cors  = require('cors');
+const http  = require('http');
 
-const app    = express();
+const app = express();
 app.use(cors());
 app.use(express.json());
+
+/* ════════════════════════════════
+   RATE LIMITING — express-rate-limit
+   Prevents API flood / cost spikes
+════════════════════════════════ */
+let rateLimit;
+try {
+  rateLimit = require('express-rate-limit');
+  const limiter = rateLimit({
+    windowMs: 60 * 1000, // 1 minute
+    max: 60,             // 60 requests per minute per IP
+    message: { error: 'Too many requests — slow down' },
+    standardHeaders: true,
+    legacyHeaders: false,
+  });
+  app.use('/admin', rateLimit({
+    windowMs: 60 * 1000,
+    max: 20, // stricter for admin endpoints
+    message: { error: 'Rate limit exceeded' },
+  }));
+  app.use(limiter);
+  console.log('[Rate Limit] Active ✓');
+} catch(e) {
+  console.warn('[Rate Limit] express-rate-limit not installed — skipping');
+}
 
 const server = http.createServer(app);
 const wss    = new WebSocketServer({ server });
 
 /* ════════════════════════════════
    FIREBASE ADMIN SDK
-   Gives server trusted write access
-   to Firestore — client can never
-   fake ELO since server owns writes
+   JWT verification + Firestore writes
+   Server is the ONLY writer of ELO
 ════════════════════════════════ */
-let db = null;
+let db    = null;
+let admin = null;
+
 try {
-  const admin = require('firebase-admin');
+  admin = require('firebase-admin');
   if (!admin.apps.length) {
-    // Service account JSON stored in Railway env var FIREBASE_SERVICE_ACCOUNT
     const serviceAccount = process.env.FIREBASE_SERVICE_ACCOUNT
       ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
       : null;
@@ -32,19 +57,86 @@ try {
         projectId: 'mogmetv',
       });
       db = admin.firestore();
-      console.log('[Firebase] Admin SDK connected ✓');
+      console.log('[Firebase] Admin SDK connected — JWT verification active ✓');
     } else {
-      console.warn('[Firebase] No service account — ELO will not persist to Firestore');
+      console.warn('[Firebase] No FIREBASE_SERVICE_ACCOUNT env var — JWT verification disabled');
     }
   }
 } catch(e) {
-  console.warn('[Firebase] Admin SDK not available:', e.message);
+  console.warn('[Firebase] Admin SDK unavailable:', e.message);
 }
 
 /* ════════════════════════════════
-   ADMIN KEY — from environment
+   JWT VERIFICATION
+   Verifies Firebase ID token sent
+   by client — prevents UID spoofing
 ════════════════════════════════ */
-const ADMIN_KEY = process.env.ADMIN_KEY || 'mogmetv_admin_local_only';
+async function verifyToken(idToken) {
+  if (!admin || !idToken) return null;
+  try {
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    return decoded; // { uid, email, ... }
+  } catch(e) {
+    console.warn('[JWT] Verification failed:', e.message);
+    return null;
+  }
+}
+
+/* ════════════════════════════════
+   CONSTANTS
+════════════════════════════════ */
+const ADMIN_KEY       = process.env.ADMIN_KEY || 'mogmetv_admin_local_only';
+const MAX_CHAT        = 100;
+const CHAT_RESET_MS   = 45 * 60 * 1000;
+const CHAT_WARN_MS    = 40 * 60 * 1000;
+const CHAT_COOLDOWN   = 1500;   // ms between chat messages per user
+const ELO_BAND        = 400;    // initial ELO match band
+const BAND_WIDEN_MS   = 30000;  // widen band every 30s
+const WEBRTC_TIMEOUT  = 15000;  // 15s WebRTC connection timeout
+const HEARTBEAT_MS    = 5000;   // queue heartbeat check
+const SCORE_MIN       = 1.0;
+const SCORE_MAX       = 10.0;
+
+/* ════════════════════════════════
+   TIER SYSTEM
+════════════════════════════════ */
+const TIERS = [
+  { name:'Slayer',   emoji:'💀', min:5001, max:Infinity },
+  { name:'Chad',     emoji:'👑', min:3501, max:5000 },
+  { name:'Chadlite', emoji:'🔥', min:2001, max:3500 },
+  { name:'HTN',      emoji:'⭐', min:1501, max:2000 },
+  { name:'MTN',      emoji:'⚡', min:1001, max:1500 },
+  { name:'LTN',      emoji:'🌙', min:501,  max:1000 },
+  { name:'Sub3',     emoji:'🔴', min:1,    max:500  },
+  { name:'Molecule', emoji:'🧪', min:-Infinity, max:0 },
+];
+
+function getTier(elo) {
+  return TIERS.find(t => elo >= t.min && elo <= t.max) || TIERS[TIERS.length-1];
+}
+
+/* ── Dynamic ELO progress (accurate tier floor/ceiling) ── */
+function calcEloProgress(elo) {
+  const tier = getTier(elo);
+  const tierIdx = TIERS.findIndex(t => t.name === tier.name);
+  const nextTier = tierIdx > 0 ? TIERS[tierIdx - 1] : null;
+  const floor = tier.min === -Infinity ? 0 : tier.min;
+  const ceiling = nextTier ? nextTier.min : tier.max;
+  const range = ceiling - floor;
+  const progress = range > 0 ? Math.min(100, Math.max(0, ((elo - floor) / range) * 100)) : 100;
+  return {
+    tier, nextTier,
+    floor, ceiling,
+    progress: Math.round(progress),
+    eloNeeded: nextTier ? Math.max(0, nextTier.min - elo) : 0,
+  };
+}
+
+function calcEloChange(won, opponentElo, myElo) {
+  const K = 32;
+  const expected = 1 / (1 + Math.pow(10, (opponentElo - myElo) / 400));
+  return Math.round(K * ((won ? 1 : 0) - expected));
+}
 
 /* ════════════════════════════════
    STATE
@@ -55,37 +147,10 @@ const matchQueue    = [];
 const activeMatches = new Map();
 const privateRooms  = new Map();
 const bannedUsers   = new Set();
-const globalStats   = { totalUsers:0, totalMatches:0, onlineNow:0 };
-const MAX_CHAT      = 100;
-const CHAT_RESET_MS = 45 * 60 * 1000;
-const CHAT_WARN_MS  = 40 * 60 * 1000;
-const ELO_BAND      = 400; // Max ELO diff for instant match
-const BAND_WIDEN_MS = 30000; // Widen band after 30s in queue
+const globalStats   = { totalUsers:0, totalMatches:0, onlineNow:0, onlineOverride:null };
 
 /* ════════════════════════════════
-   TIER SYSTEM
-════════════════════════════════ */
-function getTier(elo) {
-  if (elo >= 5001) return { name:'Slayer',   emoji:'💀' };
-  if (elo >= 3501) return { name:'Chad',     emoji:'👑' };
-  if (elo >= 2001) return { name:'Chadlite', emoji:'🔥' };
-  if (elo >= 1501) return { name:'HTN',      emoji:'⭐' };
-  if (elo >= 1001) return { name:'MTN',      emoji:'⚡' };
-  if (elo >= 501)  return { name:'LTN',      emoji:'🌙' };
-  if (elo >= 1)    return { name:'Sub3',     emoji:'🔴' };
-  return                   { name:'Molecule',emoji:'🧪' };
-}
-
-function calcEloChange(won, opponentElo, myElo) {
-  const K        = 32;
-  const expected = 1 / (1 + Math.pow(10, (opponentElo - myElo) / 400));
-  return Math.round(K * ((won ? 1 : 0) - expected));
-}
-
-/* ════════════════════════════════
-   FETCH REAL ELO FROM FIRESTORE
-   Called on set_user so server
-   always has the real values
+   FIRESTORE HELPERS
 ════════════════════════════════ */
 async function fetchUserFromFirestore(uid) {
   if (!db || !uid) return null;
@@ -93,33 +158,26 @@ async function fetchUserFromFirestore(uid) {
     const snap = await db.collection('users').doc(uid).get();
     return snap.exists ? snap.data() : null;
   } catch(e) {
-    console.error('[Firestore] fetchUser error:', e.message);
+    console.error('[Firestore] fetchUser:', e.message);
     return null;
   }
 }
 
-/* ════════════════════════════════
-   SAVE ELO TO FIRESTORE (server-authoritative)
-   Only the server writes ELO —
-   client browser cannot fake this
-════════════════════════════════ */
 async function saveEloToFirestore(uid, elo, wins, losses, matchEntry) {
   if (!db || !uid) return;
   try {
-    const ref    = db.collection('users').doc(uid);
-    const snap   = await ref.get();
-    const hist   = snap.exists ? (snap.data().matchHistory || []) : [];
+    const ref  = db.collection('users').doc(uid);
+    const snap = await ref.get();
+    const hist = snap.exists ? (snap.data().matchHistory || []) : [];
     if (matchEntry) hist.push(matchEntry);
-    // Keep last 50 matches
-    const trimmed = hist.slice(-50);
     await ref.update({
       elo, wins, losses,
-      matchHistory: trimmed,
+      matchHistory: hist.slice(-50),
       lastSeen: new Date(),
     });
     console.log(`[Firestore] ELO saved: ${uid} → ${elo}`);
   } catch(e) {
-    console.error('[Firestore] saveElo error:', e.message);
+    console.error('[Firestore] saveElo:', e.message);
   }
 }
 
@@ -128,28 +186,44 @@ async function saveEloToFirestore(uid, elo, wins, losses, matchEntry) {
 ════════════════════════════════ */
 function scheduleChatReset() {
   setTimeout(() => {
-    const warn = {
-      id:uuidv4(), userId:'system', name:'SYSTEM',
-      text:'⚠️ Chat resets in 5 minutes. Save anything important!',
-      tier:'System', tierEmoji:'⚠️', timestamp:Date.now(), isSystem:true,
-    };
+    const warn = makeSysMsg('⚠️ Chat resets in 5 minutes.');
     chatHistory.push(warn);
     broadcast({ type:'chat', message:warn });
   }, CHAT_WARN_MS);
 
   setTimeout(() => {
     chatHistory.length = 0;
-    const reset = {
-      id:uuidv4(), userId:'system', name:'SYSTEM',
-      text:'💬 Chat has been reset. Fresh start!',
-      tier:'System', tierEmoji:'💬', timestamp:Date.now(), isSystem:true,
-    };
+    const reset = makeSysMsg('💬 Chat has been reset. Fresh start!');
     chatHistory.push(reset);
     broadcast({ type:'chat_reset', message:reset });
     scheduleChatReset();
   }, CHAT_RESET_MS);
 }
 scheduleChatReset();
+
+function makeSysMsg(text) {
+  return { id:uuidv4(), userId:'system', name:'SYSTEM', text, tier:'System', tierEmoji:'⚙️', timestamp:Date.now(), isSystem:true };
+}
+
+/* ════════════════════════════════
+   MATCHMAKING HEARTBEAT
+   Removes dead sockets from queue
+   every 5 seconds
+════════════════════════════════ */
+setInterval(() => {
+  let changed = false;
+  for (let i = matchQueue.length - 1; i >= 0; i--) {
+    const u = users.get(matchQueue[i]);
+    if (!u || u.ws.readyState !== WebSocket.OPEN) {
+      matchQueue.splice(i, 1);
+      changed = true;
+    }
+  }
+  if (changed) {
+    broadcast({ type:'queue_update', size:matchQueue.length });
+    tryMatch();
+  }
+}, HEARTBEAT_MS);
 
 /* ════════════════════════════════
    WEBSOCKET
@@ -161,7 +235,8 @@ wss.on('connection', (ws) => {
     name:'Anonymous', username:'', uid:null, photoURL:'',
     elo:400, wins:0, losses:0,
     inQueue:false, inMatch:false, matchId:null,
-    queuedAt:null,
+    queuedAt:null, lastChat:0,
+    verified:false, // true once JWT verified
     connectedAt:Date.now(),
   };
 
@@ -170,7 +245,6 @@ wss.on('connection', (ws) => {
   globalStats.totalUsers++;
   console.log(`[+] ${socketId} | Online: ${users.size}`);
 
-  // Get display online count (respects admin override)
   send(ws, {
     type:'welcome', socketId,
     chatHistory: chatHistory.slice(-30),
@@ -185,43 +259,59 @@ wss.on('connection', (ws) => {
 
     switch(msg.type) {
 
-      /* ── SET USER — fetch real ELO from Firestore ── */
+      /* ── SET USER — verify JWT token ── */
       case 'set_user': {
         user.name     = (msg.name     || 'Anonymous').slice(0, 24);
         user.username = (msg.username || '').slice(0, 24);
-        user.uid      = msg.uid || null;
         user.photoURL = msg.photoURL || '';
 
-        if (user.uid) {
-          // Fetch real stats from Firestore — never trust client values
-          const fsData = await fetchUserFromFirestore(user.uid);
-          if (fsData) {
-            user.elo    = fsData.elo    || 400;
-            user.wins   = fsData.wins   || 0;
-            user.losses = fsData.losses || 0;
-            user.name   = fsData.username || user.name;
-            user.username = fsData.username || user.username;
-            console.log(`[Auth] ${user.username} | ELO: ${user.elo} (from Firestore)`);
+        if (msg.idToken && admin) {
+          // ── VERIFIED PATH: client sends Firebase ID token ──
+          const decoded = await verifyToken(msg.idToken);
+          if (decoded) {
+            user.uid      = decoded.uid;
+            user.verified = true;
+            console.log(`[JWT] Verified: ${decoded.email}`);
+
+            // Fetch real stats from Firestore — client cannot fake these
+            const fsData = await fetchUserFromFirestore(decoded.uid);
+            if (fsData) {
+              user.elo      = fsData.elo      || 400;
+              user.wins     = fsData.wins     || 0;
+              user.losses   = fsData.losses   || 0;
+              user.username = fsData.username || user.username;
+              user.name     = fsData.username || user.name;
+            }
+          } else {
+            // Token invalid — treat as guest
+            user.uid      = null;
+            user.verified = false;
           }
-        } else {
-          // Guest — use client-provided values but cap them
-          user.elo    = Math.min(Math.max(parseInt(msg.elo) || 400, 0), 10000);
-          user.wins   = parseInt(msg.wins)   || 0;
-          user.losses = parseInt(msg.losses) || 0;
+        } else if (msg.uid && !admin) {
+          // ── UNVERIFIED PATH (no Admin SDK): trust uid from client ──
+          // This is less secure but works when Admin SDK not configured
+          user.uid = msg.uid;
+          user.elo = Math.min(Math.max(parseInt(msg.elo)||400, 0), 10000);
+          user.wins   = parseInt(msg.wins)  || 0;
+          user.losses = parseInt(msg.losses)|| 0;
         }
 
-        // Check if banned
+        // Check ban
         if (user.username && bannedUsers.has(user.username.toLowerCase())) {
           send(ws, { type:'banned', message:'You have been banned from MogMe.TV.' });
-          ws.close();
-          return;
+          ws.close(); return;
         }
 
-        send(ws, { type:'user_updated', user:publicUser(user) });
+        const prog = calcEloProgress(user.elo);
+        send(ws, {
+          type:'user_updated',
+          user: publicUser(user),
+          progress: prog,
+        });
         break;
       }
 
-      /* ── CHAT — logged-in users only ── */
+      /* ── CHAT — rate limited, logged-in only ── */
       case 'chat': {
         if (!user.uid || !user.username) {
           send(ws, { type:'chat_error', error:'Sign in to chat' });
@@ -230,14 +320,20 @@ wss.on('connection', (ws) => {
         if (bannedUsers.has(user.username.toLowerCase())) break;
         if (!msg.text || !msg.text.trim()) break;
 
+        // Per-socket chat cooldown (1.5s)
+        const now = Date.now();
+        if (now - user.lastChat < CHAT_COOLDOWN) {
+          send(ws, { type:'chat_error', error:'Slow down — cooldown active' });
+          break;
+        }
+        user.lastChat = now;
+
         const tier = getTier(user.elo);
         const chatMsg = {
           id:uuidv4(), userId:socketId,
-          name:user.username,
-          photoURL:user.photoURL,
+          name:user.username, photoURL:user.photoURL,
           text:msg.text.slice(0, 200).trim(),
-          elo:user.elo,
-          tier:tier.name, tierEmoji:tier.emoji,
+          elo:user.elo, tier:tier.name, tierEmoji:tier.emoji,
           timestamp:Date.now(),
         };
         chatHistory.push(chatMsg);
@@ -267,26 +363,20 @@ wss.on('connection', (ws) => {
         break;
       }
 
-      /* ── SUBMIT SCORE — server validates ── */
+      /* ── SUBMIT SCORE — server validates strictly ── */
       case 'submit_score': {
         if (!user.inMatch || !user.matchId) break;
         const match = activeMatches.get(user.matchId);
         if (!match) break;
 
-        // Validate score range
-        const rawScore = parseFloat(msg.score);
-        if (isNaN(rawScore) || rawScore < 1 || rawScore > 10) {
-          send(ws, { type:'score_error', error:'Invalid score' });
+        const raw = parseFloat(msg.score);
+        if (isNaN(raw) || raw < SCORE_MIN || raw > SCORE_MAX) {
+          send(ws, { type:'score_error', error:'Invalid score — must be 1–10' });
           break;
         }
+        if (match.scores[socketId] !== undefined) break; // no double submit
 
-        // Rate limiting — can't submit twice
-        if (match.scores[socketId] !== undefined) break;
-
-        match.scores[socketId] = rawScore;
-        match.submitTimes      = match.submitTimes || {};
-        match.submitTimes[socketId] = Date.now();
-
+        match.scores[socketId] = raw;
         if (Object.keys(match.scores).length === 2) {
           resolveMatch(match);
         } else {
@@ -302,13 +392,11 @@ wss.on('connection', (ws) => {
         if (!match) break;
         const oppId = match.players.find(id => id !== socketId);
         const opp   = users.get(oppId);
-        if (opp) {
-          send(opp.ws, { type:'opponent_skipped' });
-          opp.inMatch = false; opp.matchId = null;
-        }
+        if (opp) { send(opp.ws,{type:'opponent_skipped'}); opp.inMatch=false; opp.matchId=null; }
+        if (match.rtcTimeout) clearTimeout(match.rtcTimeout);
         activeMatches.delete(user.matchId);
-        user.inMatch = false; user.matchId = null;
-        user.inQueue  = true; user.queuedAt = Date.now();
+        user.inMatch=false; user.matchId=null;
+        user.inQueue=true; user.queuedAt=Date.now();
         matchQueue.push(socketId);
         send(ws, { type:'queue_joined', position:matchQueue.length });
         tryMatch();
@@ -332,26 +420,36 @@ wss.on('connection', (ws) => {
         break;
       }
 
+      /* ── WEBRTC CONNECTED — cancel timeout ── */
+      case 'webrtc_connected': {
+        if (user.matchId) {
+          const match = activeMatches.get(user.matchId);
+          if (match && match.rtcTimeout) {
+            clearTimeout(match.rtcTimeout);
+            match.rtcTimeout = null;
+            match.rtcConnected = true;
+          }
+        }
+        break;
+      }
+
       /* ── PRIVATE ROOMS ── */
       case 'create_private_room': {
         const code = generateRoomCode();
         privateRooms.set(code, { code, host:socketId, guest:null, createdAt:Date.now() });
-        setTimeout(() => {
-          const r = privateRooms.get(code);
-          if (r && !r.guest) privateRooms.delete(code);
-        }, 10 * 60 * 1000);
+        setTimeout(() => { const r=privateRooms.get(code); if(r&&!r.guest) privateRooms.delete(code); }, 10*60*1000);
         send(ws, { type:'room_created', code });
         break;
       }
       case 'join_private_room': {
-        const code = (msg.code || '').toUpperCase().trim();
+        const code = (msg.code||'').toUpperCase().trim();
         const room  = privateRooms.get(code);
         if (!room)               { send(ws,{type:'room_error',error:'Invalid or expired code'}); break; }
         if (room.host===socketId){ send(ws,{type:'room_error',error:'Cannot join your own room'}); break; }
         if (room.guest)          { send(ws,{type:'room_error',error:'Room is full'}); break; }
         room.guest = socketId;
         const matchId = uuidv4();
-        const match   = { id:matchId, players:[room.host,socketId], scores:{}, type:'private', startedAt:Date.now() };
+        const match   = { id:matchId, players:[room.host,socketId], scores:{}, type:'private', startedAt:Date.now(), rtcTimeout:null };
         activeMatches.set(matchId, match);
         const host  = users.get(room.host);
         const guest = users.get(socketId);
@@ -359,15 +457,14 @@ wss.on('connection', (ws) => {
         if (guest) { guest.inMatch=true; guest.matchId=matchId; send(guest.ws, {type:'private_match_start',matchId,opponent:publicUser(host), role:'answerer'}); }
         privateRooms.delete(code);
         globalStats.totalMatches++;
+        startRtcTimeout(match);
         break;
       }
 
-      /* ── REPORT USER ── */
-      case 'report_user': {
-        console.log(`[REPORT] ${user.username} reported ${msg.targetId}: ${msg.reason}`);
+      case 'report_user':
+        console.log(`[REPORT] ${user.username} → ${msg.targetId}: ${msg.reason}`);
         send(ws, { type:'report_received' });
         break;
-      }
 
       case 'ping':
         send(ws, { type:'pong', timestamp:Date.now() });
@@ -376,12 +473,13 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('close', () => {
-    console.log(`[-] ${socketId} | Online: ${users.size - 1}`);
+    console.log(`[-] ${socketId} | Online: ${users.size-1}`);
     const qi = matchQueue.indexOf(socketId);
     if (qi > -1) matchQueue.splice(qi, 1);
     if (user.inMatch && user.matchId) {
       const match = activeMatches.get(user.matchId);
       if (match) {
+        if (match.rtcTimeout) clearTimeout(match.rtcTimeout);
         const oppId = match.players.find(id => id !== socketId);
         const opp   = users.get(oppId);
         if (opp) { send(opp.ws,{type:'opponent_disconnected'}); opp.inMatch=false; opp.matchId=null; }
@@ -398,9 +496,32 @@ wss.on('connection', (ws) => {
 });
 
 /* ════════════════════════════════
-   MATCHMAKING — ELO-BAND
-   Matches within 400 ELO first,
-   widens band after 30s wait
+   WEBRTC TIMEOUT — 15 seconds
+   If cameras don't connect, cancel
+   match and return users to queue
+════════════════════════════════ */
+function startRtcTimeout(match) {
+  match.rtcTimeout = setTimeout(() => {
+    if (match.rtcConnected) return; // already connected — no action
+    console.log(`[RTC Timeout] Match ${match.id} — returning to queue`);
+    match.players.forEach(id => {
+      const u = users.get(id);
+      if (!u) return;
+      send(u.ws, { type:'rtc_timeout', message:'Camera connection timed out — returning to queue' });
+      u.inMatch = false; u.matchId = null;
+      if (u.inQueue) return;
+      u.inQueue = true; u.queuedAt = Date.now();
+      matchQueue.push(id);
+      send(u.ws, { type:'queue_joined', position:matchQueue.length });
+    });
+    activeMatches.delete(match.id);
+    broadcast({ type:'queue_update', size:matchQueue.length });
+    tryMatch();
+  }, WEBRTC_TIMEOUT);
+}
+
+/* ════════════════════════════════
+   ELO-BAND MATCHMAKING
 ════════════════════════════════ */
 function tryMatch() {
   if (matchQueue.length < 2) return;
@@ -410,26 +531,20 @@ function tryMatch() {
     const u1  = users.get(id1);
     if (!u1 || u1.ws.readyState !== WebSocket.OPEN) { matchQueue.splice(i,1); i--; continue; }
 
-    const waitMs  = Date.now() - (u1.queuedAt || Date.now());
-    // Widen ELO band the longer they wait
-    const band    = ELO_BAND + Math.floor(waitMs / BAND_WIDEN_MS) * 200;
+    const waitMs = Date.now() - (u1.queuedAt || Date.now());
+    const band   = ELO_BAND + Math.floor(waitMs / BAND_WIDEN_MS) * 200;
 
-    for (let j = i + 1; j < matchQueue.length; j++) {
+    for (let j = i+1; j < matchQueue.length; j++) {
       const id2 = matchQueue[j];
       const u2  = users.get(id2);
       if (!u2 || u2.ws.readyState !== WebSocket.OPEN) { matchQueue.splice(j,1); j--; continue; }
 
-      const eloDiff = Math.abs(u1.elo - u2.elo);
-
-      // Match if within band OR if either player has waited > 2 minutes
-      const longWait = waitMs > 120000 || (Date.now() - (u2.queuedAt||Date.now())) > 120000;
+      const eloDiff  = Math.abs(u1.elo - u2.elo);
+      const longWait = waitMs > 120000 || (Date.now()-(u2.queuedAt||Date.now())) > 120000;
 
       if (eloDiff <= band || longWait) {
-        // Remove both from queue
-        matchQueue.splice(j, 1);
-        matchQueue.splice(i, 1);
+        matchQueue.splice(j,1); matchQueue.splice(i,1);
         createMatch(id1, id2, u1, u2);
-        // Recurse to match remaining
         setTimeout(tryMatch, 100);
         return;
       }
@@ -439,138 +554,108 @@ function tryMatch() {
 
 function createMatch(id1, id2, u1, u2) {
   const matchId = uuidv4();
-  const match   = { id:matchId, players:[id1,id2], scores:{}, type:'ranked', startedAt:Date.now() };
+  const match   = { id:matchId, players:[id1,id2], scores:{}, type:'ranked', startedAt:Date.now(), rtcTimeout:null, rtcConnected:false };
   activeMatches.set(matchId, match);
   u1.inQueue=false; u1.inMatch=true; u1.matchId=matchId;
   u2.inQueue=false; u2.inMatch=true; u2.matchId=matchId;
   globalStats.totalMatches++;
-  send(u1.ws, { type:'match_found', matchId, opponent:publicUser(u2), role:'offerer'  });
-  send(u2.ws, { type:'match_found', matchId, opponent:publicUser(u1), role:'answerer' });
-  console.log(`[MATCH] ${u1.name} (${u1.elo}) vs ${u2.name} (${u2.elo}) | diff:${Math.abs(u1.elo-u2.elo)}`);
+
+  const p1prog = calcEloProgress(u1.elo);
+  const p2prog = calcEloProgress(u2.elo);
+
+  send(u1.ws, { type:'match_found', matchId, opponent:publicUser(u2), role:'offerer',  progress:p1prog });
+  send(u2.ws, { type:'match_found', matchId, opponent:publicUser(u1), role:'answerer', progress:p2prog });
+  console.log(`[MATCH] ${u1.name}(${u1.elo}) vs ${u2.name}(${u2.elo}) | diff:${Math.abs(u1.elo-u2.elo)}`);
+
+  // Start 15-second WebRTC connection timeout
+  startRtcTimeout(match);
 }
 
 /* ════════════════════════════════
-   RESOLVE MATCH
-   Server is authoritative for ELO
-   Writes to Firestore via Admin SDK
+   RESOLVE MATCH — server owns ELO
 ════════════════════════════════ */
 async function resolveMatch(match) {
-  const [id1, id2] = match.players;
-  const u1 = users.get(id1);
-  const u2 = users.get(id2);
-  const s1 = match.scores[id1] || 0;
-  const s2 = match.scores[id2] || 0;
+  const [id1,id2] = match.players;
+  const u1=users.get(id1), u2=users.get(id2);
+  const s1=match.scores[id1]||0, s2=match.scores[id2]||0;
+  if (match.rtcTimeout) clearTimeout(match.rtcTimeout);
 
-  // Detect conflict — both submitted same score
-  const tied = Math.abs(s1 - s2) < 0.1;
+  async function settle(u, myScore, oppScore, opp) {
+    if (!u) return;
+    const won = myScore > oppScore;
+    const chg = calcEloChange(won, opp?opp.elo:400, u.elo);
+    u.elo = Math.max(0, u.elo + chg);
+    if (won) u.wins++; else u.losses++;
+    u.inMatch=false; u.matchId=null;
 
-  if (u1) {
-    const won = tied ? false : s1 > s2;
-    const chg = calcEloChange(won, u2 ? u2.elo : 400, u1.elo);
-    u1.elo    = Math.max(0, u1.elo + chg);
-    if (won) u1.wins++; else u1.losses++;
-    u1.inMatch = false; u1.matchId = null;
+    const prog = calcEloProgress(u.elo);
+    send(u.ws, {
+      type:'match_result', won, myScore, opponentScore:oppScore,
+      eloChange:chg, newElo:u.elo, newTier:getTier(u.elo), progress:prog,
+    });
 
-    const matchEntry = {
-      matchId:match.id, won, myScore:s1, oppScore:s2,
-      opponentName:u2?.username||u2?.name||'Unknown',
-      opponentElo:u2?.elo||400,
-      eloChange:chg, newElo:u1.elo,
-      date:new Date().toISOString(),
-    };
-
-    send(u1.ws, { type:'match_result', won, myScore:s1, opponentScore:s2, eloChange:chg, newElo:u1.elo, newTier:getTier(u1.elo) });
-
-    // Server writes ELO to Firestore — browser cannot override
-    if (u1.uid) {
-      saveEloToFirestore(u1.uid, u1.elo, u1.wins, u1.losses, matchEntry);
+    if (u.uid) {
+      const entry = {
+        matchId:match.id, won, myScore, oppScore,
+        opponentName:opp?.username||opp?.name||'Unknown',
+        opponentElo:opp?.elo||400, eloChange:chg, newElo:u.elo,
+        date:new Date().toISOString(),
+      };
+      saveEloToFirestore(u.uid, u.elo, u.wins, u.losses, entry);
     }
   }
 
-  if (u2) {
-    const won = tied ? false : s2 > s1;
-    const chg = calcEloChange(won, u1 ? u1.elo : 400, u2.elo);
-    u2.elo    = Math.max(0, u2.elo + chg);
-    if (won) u2.wins++; else u2.losses++;
-    u2.inMatch = false; u2.matchId = null;
-
-    const matchEntry = {
-      matchId:match.id, won, myScore:s2, oppScore:s1,
-      opponentName:u1?.username||u1?.name||'Unknown',
-      opponentElo:u1?.elo||400,
-      eloChange:chg, newElo:u2.elo,
-      date:new Date().toISOString(),
-    };
-
-    send(u2.ws, { type:'match_result', won, myScore:s2, opponentScore:s1, eloChange:chg, newElo:u2.elo, newTier:getTier(u2.elo) });
-
-    if (u2.uid) {
-      saveEloToFirestore(u2.uid, u2.elo, u2.wins, u2.losses, matchEntry);
-    }
-  }
-
+  await Promise.all([settle(u1,s1,s2,u2), settle(u2,s2,s1,u1)]);
   activeMatches.delete(match.id);
-  console.log(`[RESULT] ${s1} vs ${s2}${tied?' (TIED)':''}`);
+  console.log(`[RESULT] ${s1.toFixed(1)} vs ${s2.toFixed(1)}`);
 }
 
 /* ════════════════════════════════
    REST ENDPOINTS
 ════════════════════════════════ */
-app.get('/', (req,res) => res.json({ status:'MogMe.TV Server 🔱', online:users.size, matches:globalStats.totalMatches }));
+app.get('/', (req,res) => res.json({ status:'MogMe.TV 🔱', online:getDisplayOnline(), matches:globalStats.totalMatches }));
+app.get('/stats', (req,res) => res.json({ ...globalStats, onlineNow:getDisplayOnline(), realOnline:users.size, queueSize:matchQueue.length, activeMatches:activeMatches.size }));
 
-app.get('/stats', (req,res) => res.json({
-  ...globalStats,
-  onlineNow:    getDisplayOnline(),
-  realOnline:   users.size,
-  queueSize:    matchQueue.length,
-  activeMatches:activeMatches.size,
-}));
+// ELO progress endpoint — for frontend to get accurate bar %
+app.get('/elo-progress/:elo', (req,res) => {
+  const elo = parseInt(req.params.elo);
+  if (isNaN(elo)) { res.status(400).json({ error:'Invalid ELO' }); return; }
+  res.json(calcEloProgress(elo));
+});
 
-/* ── ADMIN ENDPOINTS ── */
-function adminAuth(req, res) {
-  if (req.body?.adminKey !== ADMIN_KEY) {
-    res.status(403).json({ error:'Unauthorized' });
-    return false;
-  }
+/* ── ADMIN ── */
+function adminAuth(req,res) {
+  if (req.body?.adminKey !== ADMIN_KEY) { res.status(403).json({error:'Unauthorized'}); return false; }
   return true;
 }
 
 app.post('/admin/broadcast', (req,res) => {
   if (!adminAuth(req,res)) return;
   const message = req.body?.message;
-  if (!message) { res.status(400).json({ error:'No message' }); return; }
-  const sysMsg = {
-    id:uuidv4(), userId:'system', name:'ADMIN',
-    text:'📢 '+message,
-    tier:'System', tierEmoji:'📢', timestamp:Date.now(), isSystem:true,
-  };
-  chatHistory.push(sysMsg);
-  broadcast({ type:'chat', message:sysMsg });
+  if (!message) { res.status(400).json({error:'No message'}); return; }
+  const m = makeSysMsg('📢 '+message);
+  chatHistory.push(m);
+  broadcast({ type:'chat', message:m });
   res.json({ ok:true });
 });
 
 app.post('/admin/reset-chat', (req,res) => {
   if (!adminAuth(req,res)) return;
   chatHistory.length = 0;
-  const msg = {
-    id:uuidv4(), userId:'system', name:'SYSTEM',
-    text:'💬 Chat reset by admin.',
-    tier:'System', tierEmoji:'💬', timestamp:Date.now(), isSystem:true,
-  };
-  chatHistory.push(msg);
-  broadcast({ type:'chat_reset', message:msg });
+  const m = makeSysMsg('💬 Chat reset by admin.');
+  chatHistory.push(m);
+  broadcast({ type:'chat_reset', message:m });
   res.json({ ok:true });
 });
 
 app.post('/admin/ban', (req,res) => {
   if (!adminAuth(req,res)) return;
   const { username } = req.body;
-  if (!username) { res.status(400).json({ error:'No username' }); return; }
+  if (!username) { res.status(400).json({error:'No username'}); return; }
   bannedUsers.add(username.toLowerCase());
-  // Kick if currently connected
   users.forEach(u => {
-    if (u.username?.toLowerCase() === username.toLowerCase()) {
-      send(u.ws, { type:'banned', message:'You have been banned.' });
+    if (u.username?.toLowerCase()===username.toLowerCase()) {
+      send(u.ws,{type:'banned',message:'You have been banned.'});
       u.ws.close();
     }
   });
@@ -586,9 +671,7 @@ app.post('/admin/unban', (req,res) => {
 app.post('/admin/set-online-override', (req,res) => {
   if (!adminAuth(req,res)) return;
   const count = parseInt(req.body?.count);
-  if (isNaN(count)) { res.status(400).json({ error:'Invalid count' }); return; }
-  globalStats.onlineOverride = count >= 0 ? count : null;
-  // Broadcast new count to all clients
+  globalStats.onlineOverride = isNaN(count) || count < 0 ? null : count;
   broadcastOnlineCount();
   res.json({ ok:true, override:globalStats.onlineOverride });
 });
@@ -606,42 +689,26 @@ app.post('/admin/clear-override', (req,res) => {
 function getDisplayOnline() {
   return globalStats.onlineOverride != null ? globalStats.onlineOverride : users.size;
 }
-
 function broadcastOnlineCount() {
   broadcast({ type:'online_count', count:getDisplayOnline() });
 }
-
 function send(ws, data) {
-  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(data));
+  if (ws && ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify(data));
 }
-
 function broadcast(data, excludeId=null) {
   const msg = JSON.stringify(data);
-  users.forEach((u,id) => {
-    if (id !== excludeId && u.ws.readyState === WebSocket.OPEN) u.ws.send(msg);
-  });
+  users.forEach((u,id) => { if (id!==excludeId && u.ws.readyState===WebSocket.OPEN) u.ws.send(msg); });
 }
-
 function publicUser(u) {
   if (!u) return null;
-  return { id:u.id, name:u.username||u.name, username:u.username, uid:u.uid, photoURL:u.photoURL, elo:u.elo, wins:u.wins, losses:u.losses, tier:getTier(u.elo) };
+  return { id:u.id, name:u.username||u.name, username:u.username, uid:u.uid, photoURL:u.photoURL, elo:u.elo, wins:u.wins, losses:u.losses, tier:getTier(u.elo), verified:u.verified };
 }
-
 function generateRoomCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let c = '';
-  for (let i=0; i<6; i++) c += chars[Math.floor(Math.random()*chars.length)];
+  for (let i=0;i<6;i++) c+=chars[Math.floor(Math.random()*chars.length)];
   return privateRooms.has(c) ? generateRoomCode() : c;
 }
 
-// Periodically clean dead players from queue
-setInterval(() => {
-  for (let i = matchQueue.length-1; i >= 0; i--) {
-    const u = users.get(matchQueue[i]);
-    if (!u || u.ws.readyState !== WebSocket.OPEN) matchQueue.splice(i,1);
-  }
-  tryMatch();
-}, 10000);
-
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🔱 MogMe.TV Server on port ${PORT}`));
+server.listen(PORT, () => console.log(`🔱 MogMe.TV on port ${PORT}`));
