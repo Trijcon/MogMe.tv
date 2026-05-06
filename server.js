@@ -327,6 +327,47 @@ app.get('/', (req,res) => res.json({ status:'MogMe.TV Server 🔱', online:users
 app.get('/stats', (req,res) => res.json({ ...globalStats, onlineNow:users.size, queueSize:matchQueue.length, activeMatches:activeMatches.size }));
 
 /* ════════════════════════════════
+   ADMIN ENDPOINTS
+   Protected by admin key
+════════════════════════════════ */
+const ADMIN_KEY = 'mogmetv_admin_2026_secure';
+
+function adminAuth(req, res) {
+  if (req.body?.adminKey !== ADMIN_KEY) {
+    res.status(403).json({ error: 'Unauthorized' });
+    return false;
+  }
+  return true;
+}
+
+app.post('/admin/broadcast', (req, res) => {
+  if (!adminAuth(req, res)) return;
+  const message = req.body?.message;
+  if (!message) { res.status(400).json({ error: 'No message' }); return; }
+  const sysMsg = {
+    id: uuidv4(), userId: 'system', name: 'ADMIN',
+    text: '📢 ' + message,
+    tier: 'System', tierEmoji: '📢', timestamp: Date.now(), isSystem: true,
+  };
+  chatHistory.push(sysMsg);
+  broadcast({ type: 'chat', message: sysMsg });
+  res.json({ ok: true });
+});
+
+app.post('/admin/reset-chat', (req, res) => {
+  if (!adminAuth(req, res)) return;
+  chatHistory.length = 0;
+  const resetMsg = {
+    id: uuidv4(), userId: 'system', name: 'SYSTEM',
+    text: '💬 Chat has been reset by admin.',
+    tier: 'System', tierEmoji: '💬', timestamp: Date.now(), isSystem: true,
+  };
+  chatHistory.push(resetMsg);
+  broadcast({ type: 'chat_reset', message: resetMsg });
+  res.json({ ok: true });
+});
+
+/* ════════════════════════════════
    HELPERS
 ════════════════════════════════ */
 function send(ws, data) {
