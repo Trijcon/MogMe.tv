@@ -558,6 +558,14 @@ wss.on('connection', (ws) => {
         if (!user.inMatch || !user.matchId) break;
         const match = activeMatches.get(user.matchId);
         if (!match) break;
+        if (match.type !== 'bot' && !match.rtcConnected) {
+          send(ws, { type:'score_error', error:'Camera connection is not ready yet' });
+          break;
+        }
+        if (Date.now() - match.startedAt < 4000) {
+          send(ws, { type:'score_error', error:'Scan submitted too quickly' });
+          break;
+        }
 
         const raw = parseFloat(msg.score);
         if (isNaN(raw) || raw < SCORE_MIN || raw > SCORE_MAX) {
@@ -566,7 +574,7 @@ wss.on('connection', (ws) => {
         }
         if (match.scores[socketId] !== undefined) break; // no double submit
 
-        match.scores[socketId] = raw;
+        match.scores[socketId] = Math.round(raw * 10) / 10;
         if (Object.keys(match.scores).length === 2) {
           resolveMatch(match);
         } else {
