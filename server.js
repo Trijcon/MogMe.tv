@@ -550,6 +550,24 @@ wss.on('connection', (ws) => {
         send(ws, { type:'report_received' });
         break;
 
+      /* ── PUBLIC APPEAL RATING (1–10, given to opponent after a match) ── */
+      case 'rate_opponent': {
+        const r = parseInt(msg.rating);
+        if (isNaN(r) || r < 1 || r > 10) break;
+        const target = users.get(msg.targetId);
+        if (!target || !target.uid || !db) break;
+        // Only allow rating once per match (best-effort — server doesn't track this; client also disables buttons)
+        try {
+          const ref = db.collection('users').doc(target.uid);
+          await ref.update({
+            appealSum:   admin.firestore.FieldValue.increment(r),
+            appealCount: admin.firestore.FieldValue.increment(1),
+          });
+          console.log(`[APPEAL] ${user.username} rated ${target.username}: ${r}`);
+        } catch(e) { console.warn('[APPEAL] write failed:', e.message); }
+        break;
+      }
+
       case 'ping':
         send(ws, { type:'pong', timestamp:Date.now() });
         break;
