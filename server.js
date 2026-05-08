@@ -3,10 +3,40 @@ const { WebSocketServer, WebSocket } = require('ws');
 const { v4: uuidv4 } = require('uuid');
 const cors  = require('cors');
 const http  = require('http');
+const crypto = require('crypto');
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+const CORS_ORIGINS = (process.env.CORS_ORIGINS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
+if (process.env.TRUST_PROXY) app.set('trust proxy', process.env.TRUST_PROXY === 'true' ? 1 : process.env.TRUST_PROXY);
+if (CORS_ORIGINS.length) {
+  app.use(cors({
+    origin(origin, cb) {
+      if (!origin || CORS_ORIGINS.includes(origin)) return cb(null, true);
+      return cb(new Error('Not allowed by CORS'));
+    },
+  }));
+} else {
+  app.use(cors());
+}
+app.use(express.json({ limit: '100kb' }));
+
+const IS_PRODUCTION =
+  process.env.NODE_ENV === 'production' ||
+  !!process.env.RAILWAY_ENVIRONMENT ||
+  !!process.env.RENDER ||
+  !!process.env.FLY_APP_NAME;
+const ALLOW_UNVERIFIED_USERS = !IS_PRODUCTION && process.env.ALLOW_UNVERIFIED_USERS === 'true';
+const REQUIRE_AUTH_FOR_RANKED = process.env.REQUIRE_AUTH_FOR_RANKED !== 'false';
+const ADMIN_UIDS = new Set(
+  (process.env.ADMIN_UIDS || 'wqHmlndLquOdIKgK3pLrz2WwGgI3')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean)
+);
 
 /* ════════════════════════════════
    RATE LIMITING — express-rate-limit
@@ -14,7 +44,8 @@ app.use(express.json());
 ════════════════════════════════ */
 let rateLimit;
 try {
-  rateLimit = require('express-rate-limit');
+  const rateLimitLib = require('express-rate-limit');
+  rateLimit = rateLimitLib.rateLimit || rateLimitLib.default || rateLimitLib;
   const limiter = rateLimit({
     windowMs: 60 * 1000, // 1 minute
     max: 60,             // 60 requests per minute per IP
@@ -47,14 +78,17 @@ let admin = null;
 try {
   admin = require('firebase-admin');
   if (!admin.apps.length) {
-    const serviceAccount = process.env.FIREBASE_SERVICE_ACCOUNT
-      ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
-      : null;
+    let serviceAccount = null;
+    if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+      const raw = process.env.FIREBASE_SERVICE_ACCOUNT.trim();
+      const json = raw.startsWith('{') ? raw : Buffer.from(raw, 'base64').toString('utf8');
+      serviceAccount = JSON.parse(json);
+    }
 
     if (serviceAccount) {
       admin.initializeApp({
         credential: admin.credential.cert(serviceAccount),
-        projectId: 'mogmetv',
+        projectId: process.env.FIREBASE_PROJECT_ID || 'mogmetv',
       });
       db = admin.firestore();
       console.log('[Firebase] Admin SDK connected — JWT verification active ✓');
@@ -71,6 +105,24 @@ try {
    Verifies Firebase ID token sent
    by client — prevents UID spoofing
 ════════════════════════════════ */
+if (admin && !db) {
+  try {
+    if (!admin.apps.length) {
+      admin.initializeApp({ projectId: process.env.FIREBASE_PROJECT_ID || 'mogmetv' });
+    }
+    db = admin.firestore();
+    console.log('[Firebase] Admin SDK connected - JWT verification active');
+  } catch (e) {
+    admin = null;
+    db = null;
+    console.error('[Firebase] Admin SDK init failed:', e.message);
+  }
+}
+
+if ((IS_PRODUCTION || process.env.REQUIRE_FIREBASE_ADMIN === 'true') && !db) {
+  console.error('[Security] Firebase Admin is unavailable. Ranked persistence, verified chat, and token-based admin routes are disabled.');
+}
+
 async function verifyToken(idToken) {
   if (!admin || !idToken) return null;
   try {
@@ -85,7 +137,56 @@ async function verifyToken(idToken) {
 /* ════════════════════════════════
    CONSTANTS
 ════════════════════════════════ */
-const ADMIN_KEY       = process.env.ADMIN_KEY || 'mogmetv_admin_local_only';
+function safeEqual(a, b) {
+  if (!a || !b) return false;
+  const aa = Buffer.from(String(a));
+  const bb = Buffer.from(String(b));
+  return aa.length === bb.length && crypto.timingSafeEqual(aa, bb);
+}
+
+function cleanText(value, fallback = '', max = 24) {
+  const cleaned = String(value || '')
+    .replace(/[\u0000-\u001f\u007f]/g, '')
+    .trim()
+    .slice(0, max);
+  return cleaned || fallback;
+}
+
+function cleanUsername(value) {
+  const username = cleanText(value, '', 24);
+  return /^[a-zA-Z0-9_]{3,24}$/.test(username) ? username : '';
+}
+
+function cleanPhotoUrl(value) {
+  const url = cleanText(value, '', 4096);
+  if (!url) return '';
+  if (/^https:\/\/[^\s"'<>]+$/i.test(url)) return url;
+  if (/^data:image\/(png|jpe?g|webp);base64,[a-z0-9+/=]+$/i.test(url)) return url;
+  return '';
+}
+
+function canUseVerifiedIdentity(user) {
+  return !!user?.verified || ALLOW_UNVERIFIED_USERS;
+}
+
+async function isBannedUsername(username) {
+  const name = cleanUsername(username).toLowerCase();
+  if (!name) return false;
+  if (bannedUsers.has(name)) return true;
+  if (!db) return false;
+  try {
+    const snap = await db.collection('bans').doc(name).get();
+    if (snap.exists) {
+      bannedUsers.add(name);
+      return true;
+    }
+  } catch(e) {
+    console.warn('[Bans] lookup failed:', e.message);
+  }
+  return false;
+}
+
+const ADMIN_KEY       = process.env.ADMIN_KEY || null;
 const MAX_CHAT        = 100;
 const CHAT_RESET_MS   = 45 * 60 * 1000;
 const CHAT_WARN_MS    = 40 * 60 * 1000;
@@ -95,6 +196,7 @@ const BAND_WIDEN_MS   = 30000;  // widen band every 30s
 const WEBRTC_TIMEOUT  = 15000;  // 15s WebRTC connection timeout
 const HEARTBEAT_MS    = 5000;   // queue heartbeat check
 const BOT_TIMEOUT_MS  = 15000;  // 15s alone in queue → bot opponent
+const MATCH_TIMEOUT_MS = 90000; // 90s hard match cap — auto-resolves even if a player is AFK
 const SCORE_MIN       = 1.0;
 const SCORE_MAX       = 10.0;
 
@@ -316,6 +418,7 @@ wss.on('connection', (ws) => {
     inQueue:false, inMatch:false, matchId:null,
     queuedAt:null, lastChat:0,
     verified:false, // true once JWT verified
+    ratedMatches:new Set(), lastMatchId:null, lastOpponentId:null,
     connectedAt:Date.now(),
   };
 
@@ -340,9 +443,9 @@ wss.on('connection', (ws) => {
 
       /* ── SET USER — verify JWT token ── */
       case 'set_user': {
-        user.name     = (msg.name     || 'Anonymous').slice(0, 24);
-        user.username = (msg.username || '').slice(0, 24);
-        user.photoURL = msg.photoURL || '';
+        user.name     = cleanText(msg.name, 'Anonymous', 24);
+        user.username = cleanUsername(msg.username);
+        user.photoURL = cleanPhotoUrl(msg.photoURL);
 
         if (msg.idToken && admin) {
           // ── VERIFIED PATH: client sends Firebase ID token ──
@@ -358,25 +461,29 @@ wss.on('connection', (ws) => {
               user.elo      = fsData.elo      || 400;
               user.wins     = fsData.wins     || 0;
               user.losses   = fsData.losses   || 0;
-              user.username = fsData.username || user.username;
-              user.name     = fsData.username || user.name;
+              user.username = cleanUsername(fsData.username) || user.username;
+              user.name     = cleanText(fsData.username, user.name, 24);
+              user.photoURL = cleanPhotoUrl(fsData.photoURL) || user.photoURL;
             }
           } else {
             // Token invalid — treat as guest
             user.uid      = null;
             user.verified = false;
           }
-        } else if (msg.uid && !admin) {
+        } else if (msg.idToken && !admin) {
+          send(ws, { type:'auth_error', error:'Authentication is temporarily unavailable' });
+        } else if (msg.uid && ALLOW_UNVERIFIED_USERS) {
           // ── UNVERIFIED PATH (no Admin SDK): trust uid from client ──
           // This is less secure but works when Admin SDK not configured
           user.uid = msg.uid;
           user.elo = Math.min(Math.max(parseInt(msg.elo)||400, 0), 10000);
           user.wins   = parseInt(msg.wins)  || 0;
           user.losses = parseInt(msg.losses)|| 0;
+          user.verified = false;
         }
 
         // Check ban
-        if (user.username && bannedUsers.has(user.username.toLowerCase())) {
+        if (user.username && await isBannedUsername(user.username)) {
           send(ws, { type:'banned', message:'You have been banned from MogMe.TV.' });
           ws.close(); return;
         }
@@ -392,11 +499,11 @@ wss.on('connection', (ws) => {
 
       /* ── CHAT — rate limited, logged-in only ── */
       case 'chat': {
-        if (!user.uid || !user.username) {
+        if (!user.uid || !user.username || !canUseVerifiedIdentity(user)) {
           send(ws, { type:'chat_error', error:'Sign in to chat' });
           break;
         }
-        if (bannedUsers.has(user.username.toLowerCase())) break;
+        if (await isBannedUsername(user.username)) break;
         if (!msg.text || !msg.text.trim()) break;
 
         // Per-socket chat cooldown (1.5s)
@@ -423,6 +530,10 @@ wss.on('connection', (ws) => {
 
       /* ── JOIN QUEUE ── */
       case 'join_queue':
+        if (REQUIRE_AUTH_FOR_RANKED && !canUseVerifiedIdentity(user)) {
+          send(ws, { type:'queue_error', error:'Sign in to play ranked' });
+          break;
+        }
         if (user.inQueue || user.inMatch) break;
         user.inQueue  = true;
         user.queuedAt = Date.now();
@@ -470,7 +581,6 @@ wss.on('connection', (ws) => {
         const match = activeMatches.get(user.matchId);
         if (!match) break;
         if (match.type === 'bot') {
-          // Bot match — just teardown; no opponent to notify
           if (match.botTimer) clearTimeout(match.botTimer);
         } else {
           const oppId = match.players.find(id => id !== socketId);
@@ -478,6 +588,7 @@ wss.on('connection', (ws) => {
           if (opp) { send(opp.ws,{type:'opponent_skipped'}); opp.inMatch=false; opp.matchId=null; }
           if (match.rtcTimeout) clearTimeout(match.rtcTimeout);
         }
+        if (match.matchTimeout) clearTimeout(match.matchTimeout);
         activeMatches.delete(user.matchId);
         user.inMatch=false; user.matchId=null;
         user.inQueue=true; user.queuedAt=Date.now();
@@ -555,7 +666,8 @@ wss.on('connection', (ws) => {
         const r = parseInt(msg.rating);
         if (isNaN(r) || r < 1 || r > 10) break;
         const target = users.get(msg.targetId);
-        if (!target || !target.uid || !db) break;
+        if (!target || !target.uid || !db || !canUseVerifiedIdentity(user)) break;
+        if (!user.lastMatchId || user.lastOpponentId !== msg.targetId || user.ratedMatches.has(user.lastMatchId)) break;
         // Only allow rating once per match (best-effort — server doesn't track this; client also disables buttons)
         try {
           const ref = db.collection('users').doc(target.uid);
@@ -563,6 +675,7 @@ wss.on('connection', (ws) => {
             appealSum:   admin.firestore.FieldValue.increment(r),
             appealCount: admin.firestore.FieldValue.increment(1),
           });
+          user.ratedMatches.add(user.lastMatchId);
           console.log(`[APPEAL] ${user.username} rated ${target.username}: ${r}`);
         } catch(e) { console.warn('[APPEAL] write failed:', e.message); }
         break;
@@ -581,8 +694,9 @@ wss.on('connection', (ws) => {
     if (user.inMatch && user.matchId) {
       const match = activeMatches.get(user.matchId);
       if (match) {
-        if (match.rtcTimeout) clearTimeout(match.rtcTimeout);
-        if (match.botTimer)   clearTimeout(match.botTimer);
+        if (match.rtcTimeout)   clearTimeout(match.rtcTimeout);
+        if (match.botTimer)     clearTimeout(match.botTimer);
+        if (match.matchTimeout) clearTimeout(match.matchTimeout);
         if (match.type !== 'bot') {
           const oppId = match.players.find(id => id !== socketId);
           const opp   = users.get(oppId);
@@ -672,8 +786,27 @@ function createMatch(id1, id2, u1, u2) {
   send(u2.ws, { type:'match_found', matchId, opponent:publicUser(u1), role:'answerer', progress:p2prog });
   console.log(`[MATCH] ${u1.name}(${u1.elo}) vs ${u2.name}(${u2.elo}) | diff:${Math.abs(u1.elo-u2.elo)}`);
 
-  // Start 15-second WebRTC connection timeout
+  // 15s WebRTC connection timeout
   startRtcTimeout(match);
+  // 90s hard match cap so AFK / hung matches don't last forever
+  startMatchTimeout(match);
+}
+
+/* ════════════════════════════════
+   MATCH TIMEOUT — 90s hard cap
+   If both haven't submitted, fill in zeros for whoever didn't
+   and resolve the match anyway.
+════════════════════════════════ */
+function startMatchTimeout(match) {
+  match.matchTimeout = setTimeout(() => {
+    if (!activeMatches.has(match.id)) return;
+    console.log(`[MATCH TIMEOUT] ${match.id} — auto-resolving`);
+    // Fill missing scores with 0 so loser is whoever didn't scan
+    match.players.forEach(id => {
+      if (match.scores[id] === undefined) match.scores[id] = 0;
+    });
+    resolveMatch(match);
+  }, MATCH_TIMEOUT_MS);
 }
 
 /* ════════════════════════════════
@@ -681,8 +814,9 @@ function createMatch(id1, id2, u1, u2) {
 ════════════════════════════════ */
 async function resolveMatch(match) {
   const [id1,id2] = match.players;
-  if (match.rtcTimeout) clearTimeout(match.rtcTimeout);
-  if (match.botTimer)   clearTimeout(match.botTimer);
+  if (match.rtcTimeout)   clearTimeout(match.rtcTimeout);
+  if (match.botTimer)     clearTimeout(match.botTimer);
+  if (match.matchTimeout) clearTimeout(match.matchTimeout);
 
   // Private match — unranked, no ELO change, just deliver the result
   if (match.type === 'private') {
@@ -726,7 +860,7 @@ async function resolveMatch(match) {
       type:'match_result', won, myScore, opponentScore:botScore,
       eloChange:chg, newElo:u.elo, newTier:getTier(u.elo), progress:prog, bot:true,
     });
-    if (u.uid) {
+    if (u.uid && canUseVerifiedIdentity(u)) {
       saveEloToFirestore(u.uid, u.elo, u.wins, u.losses, {
         matchId:match.id, won, myScore, oppScore:botScore,
         opponentName: bot.name + ' (bot)',
@@ -750,6 +884,8 @@ async function resolveMatch(match) {
     u.elo = Math.max(0, u.elo + chg);
     if (won) u.wins++; else u.losses++;
     u.inMatch=false; u.matchId=null;
+    u.lastMatchId = match.id;
+    u.lastOpponentId = opp?.id || null;
 
     const prog = calcEloProgress(u.elo);
     send(u.ws, {
@@ -757,7 +893,7 @@ async function resolveMatch(match) {
       eloChange:chg, newElo:u.elo, newTier:getTier(u.elo), progress:prog,
     });
 
-    if (u.uid) {
+    if (u.uid && canUseVerifiedIdentity(u)) {
       const entry = {
         matchId:match.id, won, myScore, oppScore,
         opponentName:opp?.username||opp?.name||'Unknown',
@@ -787,13 +923,26 @@ app.get('/elo-progress/:elo', (req,res) => {
 });
 
 /* ── ADMIN ── */
-function adminAuth(req,res) {
-  if (req.body?.adminKey !== ADMIN_KEY) { res.status(403).json({error:'Unauthorized'}); return false; }
-  return true;
+async function adminAuth(req,res) {
+  const header = req.get('authorization') || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+
+  if (token && admin) {
+    const decoded = await verifyToken(token);
+    if (decoded && ADMIN_UIDS.has(decoded.uid)) return decoded;
+  }
+
+  const providedKey = req.body?.adminKey || req.get('x-admin-key');
+  if (ADMIN_KEY && safeEqual(providedKey, ADMIN_KEY)) {
+    return { uid:'admin-key', authMode:'admin-key' };
+  }
+
+  res.status(403).json({error:'Unauthorized'});
+  return null;
 }
 
-app.post('/admin/broadcast', (req,res) => {
-  if (!adminAuth(req,res)) return;
+app.post('/admin/broadcast', async (req,res) => {
+  if (!await adminAuth(req,res)) return;
   const message = req.body?.message;
   if (!message) { res.status(400).json({error:'No message'}); return; }
   const m = makeSysMsg('📢 '+message);
@@ -802,8 +951,8 @@ app.post('/admin/broadcast', (req,res) => {
   res.json({ ok:true });
 });
 
-app.post('/admin/reset-chat', (req,res) => {
-  if (!adminAuth(req,res)) return;
+app.post('/admin/reset-chat', async (req,res) => {
+  if (!await adminAuth(req,res)) return;
   chatHistory.length = 0;
   const m = makeSysMsg('💬 Chat reset by admin.');
   chatHistory.push(m);
@@ -811,9 +960,9 @@ app.post('/admin/reset-chat', (req,res) => {
   res.json({ ok:true });
 });
 
-app.post('/admin/ban', (req,res) => {
-  if (!adminAuth(req,res)) return;
-  const { username } = req.body;
+app.post('/admin/ban', async (req,res) => {
+  if (!await adminAuth(req,res)) return;
+  const username = cleanUsername(req.body?.username);
   if (!username) { res.status(400).json({error:'No username'}); return; }
   bannedUsers.add(username.toLowerCase());
   users.forEach(u => {
@@ -825,22 +974,22 @@ app.post('/admin/ban', (req,res) => {
   res.json({ ok:true });
 });
 
-app.post('/admin/unban', (req,res) => {
-  if (!adminAuth(req,res)) return;
-  bannedUsers.delete((req.body?.username||'').toLowerCase());
+app.post('/admin/unban', async (req,res) => {
+  if (!await adminAuth(req,res)) return;
+  bannedUsers.delete(cleanUsername(req.body?.username).toLowerCase());
   res.json({ ok:true });
 });
 
-app.post('/admin/set-online-override', (req,res) => {
-  if (!adminAuth(req,res)) return;
+app.post('/admin/set-online-override', async (req,res) => {
+  if (!await adminAuth(req,res)) return;
   const count = parseInt(req.body?.count);
   globalStats.onlineOverride = isNaN(count) || count < 0 ? null : count;
   broadcastOnlineCount();
   res.json({ ok:true, override:globalStats.onlineOverride });
 });
 
-app.post('/admin/clear-override', (req,res) => {
-  if (!adminAuth(req,res)) return;
+app.post('/admin/clear-override', async (req,res) => {
+  if (!await adminAuth(req,res)) return;
   globalStats.onlineOverride = null;
   broadcastOnlineCount();
   res.json({ ok:true });
