@@ -94,8 +94,38 @@ const ELO_BAND        = 400;    // initial ELO match band
 const BAND_WIDEN_MS   = 30000;  // widen band every 30s
 const WEBRTC_TIMEOUT  = 15000;  // 15s WebRTC connection timeout
 const HEARTBEAT_MS    = 5000;   // queue heartbeat check
+const BOT_TIMEOUT_MS  = 15000;  // 15s alone in queue → bot opponent
 const SCORE_MIN       = 1.0;
 const SCORE_MAX       = 10.0;
+
+/* Bot opponent name pool */
+const BOT_NAMES = [
+  'ApexK','NordicG','ZeusMode','IronWill','PhiRatio','SilentMax',
+  'CanthalK','JawGod','MewingPro','LooksMax','NTfacial','SigmaFace',
+  'ChadliteX','HunterEye','PrimeMog','GoldenPhi','BoneSmash','RatioKing'
+];
+
+function makeBotOpponent(targetElo) {
+  // Bot ELO within ±150 of target user
+  const elo = Math.max(0, targetElo + Math.floor((Math.random()*2-1) * 150));
+  const name = BOT_NAMES[Math.floor(Math.random()*BOT_NAMES.length)] + Math.floor(Math.random()*99);
+  return {
+    id: 'bot_' + uuidv4().slice(0,8),
+    bot: true,
+    name, username: name,
+    uid: null, photoURL: '',
+    elo, wins: Math.floor(Math.random()*30), losses: Math.floor(Math.random()*30),
+    verified: false,
+  };
+}
+
+function botPickScore(userElo) {
+  /* Bot score is biased to feel realistic for opponent's apparent ELO */
+  const t = Math.max(0, Math.min(1, userElo / 5000));
+  const base = 4.0 + t * 4.5;            // 4.0–8.5 baseline by ELO
+  const noise = (Math.random()*2 - 1)*1.2;
+  return Math.max(SCORE_MIN, Math.min(SCORE_MAX, +(base + noise).toFixed(1)));
+}
 
 /* ════════════════════════════════
    TIER SYSTEM
@@ -223,7 +253,69 @@ setInterval(() => {
     broadcast({ type:'queue_update', size:matchQueue.length });
     tryMatch();
   }
+
+  /* Bot fallback: anyone alone in queue past BOT_TIMEOUT_MS gets a bot opponent.
+     Pairs them up immediately so the match always completes. */
+  const now = Date.now();
+  for (let i = matchQueue.length - 1; i >= 0; i--) {
+    const id = matchQueue[i];
+    const u  = users.get(id);
+    if (!u || u.ws.readyState !== WebSocket.OPEN) continue;
+    const wait = now - (u.queuedAt || now);
+    if (wait < BOT_TIMEOUT_MS) continue;
+    // Skip if there's still another real player waiting (let real-match logic handle it)
+    if (matchQueue.length >= 2) continue;
+    matchQueue.splice(i, 1);
+    createBotMatch(u, id);
+  }
 }, HEARTBEAT_MS);
+
+/* ════════════════════════════════
+   BOT MATCH — no WebRTC, server simulates opponent
+════════════════════════════════ */
+function createBotMatch(u, id) {
+  const matchId = uuidv4();
+  const bot = makeBotOpponent(u.elo);
+  const match = {
+    id: matchId,
+    players: [id, bot.id],
+    scores: {},
+    type: 'bot',
+    bot: bot,
+    startedAt: Date.now(),
+    rtcTimeout: null,
+    rtcConnected: true,   // skip RTC timeout — bot has no camera
+  };
+  activeMatches.set(matchId, match);
+  u.inQueue = false;
+  u.inMatch = true;
+  u.matchId = matchId;
+  globalStats.totalMatches++;
+
+  const prog = calcEloProgress(u.elo);
+  send(u.ws, {
+    type: 'match_found',
+    matchId,
+    opponent: bot,
+    role: 'offerer',
+    bot: true,
+    progress: prog,
+  });
+  console.log(`[BOT] ${u.name}(${u.elo}) vs ${bot.name}(${bot.elo})`);
+
+  // Bot "submits" a score after 6–11 seconds
+  const botDelay = 6000 + Math.floor(Math.random()*5000);
+  match.botTimer = setTimeout(() => {
+    if (!activeMatches.has(matchId)) return;
+    const botScore = botPickScore(u.elo);
+    match.scores[bot.id] = botScore;
+    if (Object.keys(match.scores).length === 2) {
+      resolveMatch(match);
+    } else {
+      send(u.ws, { type: 'opponent_scored' });
+    }
+  }, botDelay);
+}
 
 /* ════════════════════════════════
    WEBSOCKET
@@ -390,10 +482,15 @@ wss.on('connection', (ws) => {
         if (!user.inMatch || !user.matchId) break;
         const match = activeMatches.get(user.matchId);
         if (!match) break;
-        const oppId = match.players.find(id => id !== socketId);
-        const opp   = users.get(oppId);
-        if (opp) { send(opp.ws,{type:'opponent_skipped'}); opp.inMatch=false; opp.matchId=null; }
-        if (match.rtcTimeout) clearTimeout(match.rtcTimeout);
+        if (match.type === 'bot') {
+          // Bot match — just teardown; no opponent to notify
+          if (match.botTimer) clearTimeout(match.botTimer);
+        } else {
+          const oppId = match.players.find(id => id !== socketId);
+          const opp   = users.get(oppId);
+          if (opp) { send(opp.ws,{type:'opponent_skipped'}); opp.inMatch=false; opp.matchId=null; }
+          if (match.rtcTimeout) clearTimeout(match.rtcTimeout);
+        }
         activeMatches.delete(user.matchId);
         user.inMatch=false; user.matchId=null;
         user.inQueue=true; user.queuedAt=Date.now();
@@ -480,9 +577,12 @@ wss.on('connection', (ws) => {
       const match = activeMatches.get(user.matchId);
       if (match) {
         if (match.rtcTimeout) clearTimeout(match.rtcTimeout);
-        const oppId = match.players.find(id => id !== socketId);
-        const opp   = users.get(oppId);
-        if (opp) { send(opp.ws,{type:'opponent_disconnected'}); opp.inMatch=false; opp.matchId=null; }
+        if (match.botTimer)   clearTimeout(match.botTimer);
+        if (match.type !== 'bot') {
+          const oppId = match.players.find(id => id !== socketId);
+          const opp   = users.get(oppId);
+          if (opp) { send(opp.ws,{type:'opponent_disconnected'}); opp.inMatch=false; opp.matchId=null; }
+        }
         activeMatches.delete(user.matchId);
       }
     }
@@ -576,9 +676,67 @@ function createMatch(id1, id2, u1, u2) {
 ════════════════════════════════ */
 async function resolveMatch(match) {
   const [id1,id2] = match.players;
+  if (match.rtcTimeout) clearTimeout(match.rtcTimeout);
+  if (match.botTimer)   clearTimeout(match.botTimer);
+
+  // Private match — unranked, no ELO change, just deliver the result
+  if (match.type === 'private') {
+    for (const id of match.players) {
+      const u = users.get(id);
+      if (!u) continue;
+      const myScore = match.scores[id] || 0;
+      const oppId  = match.players.find(p => p !== id);
+      const oppScore = match.scores[oppId] || 0;
+      const won = myScore > oppScore;
+      send(u.ws, {
+        type: 'match_result',
+        won, myScore, opponentScore: oppScore,
+        eloChange: 0, newElo: u.elo,
+        newTier: getTier(u.elo),
+        progress: calcEloProgress(u.elo),
+        unranked: true,
+      });
+      u.inMatch = false; u.matchId = null;
+    }
+    activeMatches.delete(match.id);
+    console.log(`[PRIVATE RESULT] ${(match.scores[match.players[0]]||0).toFixed(1)} vs ${(match.scores[match.players[1]]||0).toFixed(1)}`);
+    return;
+  }
+
+  // Bot match — only one real player, opponent is the stored bot object
+  if (match.type === 'bot') {
+    const u  = users.get(id1);
+    const bot = match.bot;
+    const myScore  = match.scores[id1] || 0;
+    const botScore = match.scores[bot.id] || 0;
+    if (!u) { activeMatches.delete(match.id); return; }
+    const won = myScore > botScore;
+    const chg = calcEloChange(won, bot.elo, u.elo);
+    u.elo = Math.max(0, u.elo + chg);
+    if (won) u.wins++; else u.losses++;
+    u.inMatch = false; u.matchId = null;
+
+    const prog = calcEloProgress(u.elo);
+    send(u.ws, {
+      type:'match_result', won, myScore, opponentScore:botScore,
+      eloChange:chg, newElo:u.elo, newTier:getTier(u.elo), progress:prog, bot:true,
+    });
+    if (u.uid) {
+      saveEloToFirestore(u.uid, u.elo, u.wins, u.losses, {
+        matchId:match.id, won, myScore, oppScore:botScore,
+        opponentName: bot.name + ' (bot)',
+        opponentElo: bot.elo, eloChange:chg, newElo:u.elo,
+        date:new Date().toISOString(), bot:true,
+      });
+    }
+    activeMatches.delete(match.id);
+    console.log(`[BOT RESULT] ${myScore.toFixed(1)} vs ${botScore.toFixed(1)}`);
+    return;
+  }
+
+  // Normal PvP match
   const u1=users.get(id1), u2=users.get(id2);
   const s1=match.scores[id1]||0, s2=match.scores[id2]||0;
-  if (match.rtcTimeout) clearTimeout(match.rtcTimeout);
 
   async function settle(u, myScore, oppScore, opp) {
     if (!u) return;
