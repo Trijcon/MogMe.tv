@@ -254,20 +254,7 @@ setInterval(() => {
     tryMatch();
   }
 
-  /* Bot fallback: anyone alone in queue past BOT_TIMEOUT_MS gets a bot opponent.
-     Pairs them up immediately so the match always completes. */
-  const now = Date.now();
-  for (let i = matchQueue.length - 1; i >= 0; i--) {
-    const id = matchQueue[i];
-    const u  = users.get(id);
-    if (!u || u.ws.readyState !== WebSocket.OPEN) continue;
-    const wait = now - (u.queuedAt || now);
-    if (wait < BOT_TIMEOUT_MS) continue;
-    // Skip if there's still another real player waiting (let real-match logic handle it)
-    if (matchQueue.length >= 2) continue;
-    matchQueue.splice(i, 1);
-    createBotMatch(u, id);
-  }
+  /* Bot fallback DISABLED — 1v1 arena matches real humans only */
 }, HEARTBEAT_MS);
 
 /* ════════════════════════════════
