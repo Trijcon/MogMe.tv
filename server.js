@@ -43,6 +43,7 @@ const wss    = new WebSocketServer({ server });
 ════════════════════════════════ */
 let db    = null;
 let admin = null;
+const FIREBASE_WEB_API_KEY = process.env.FIREBASE_WEB_API_KEY || 'AIzaSyBpMuv59Rlhc2roSiTPBzjKKHjuwqe0TFs';
 
 try {
   admin = require('firebase-admin');
@@ -72,10 +73,27 @@ try {
    by client — prevents UID spoofing
 ════════════════════════════════ */
 async function verifyToken(idToken) {
-  if (!admin || !idToken) return null;
+  if (!idToken) return null;
+  if (admin && admin.apps && admin.apps.length) {
+    try {
+      const decoded = await admin.auth().verifyIdToken(idToken);
+      return decoded; // { uid, email, ... }
+    } catch(e) {
+      console.warn('[JWT] Admin verification failed:', e.message);
+    }
+  }
+
+  if (!FIREBASE_WEB_API_KEY || typeof fetch !== 'function') return null;
   try {
-    const decoded = await admin.auth().verifyIdToken(idToken);
-    return decoded; // { uid, email, ... }
+    const res = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${FIREBASE_WEB_API_KEY}`, {
+      method:'POST',
+      headers:{ 'Content-Type':'application/json' },
+      body:JSON.stringify({ idToken }),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const fbUser = data.users && data.users[0];
+    return fbUser ? { uid:fbUser.localId, email:fbUser.email || '' } : null;
   } catch(e) {
     console.warn('[JWT] Verification failed:', e.message);
     return null;
@@ -85,7 +103,7 @@ async function verifyToken(idToken) {
 /* ════════════════════════════════
    CONSTANTS
 ════════════════════════════════ */
-const ADMIN_KEY       = process.env.ADMIN_KEY || 'mogmetv_admin_local_only';
+const ADMIN_KEY       = process.env.ADMIN_KEY || null;
 const MAX_CHAT        = 100;
 const CHAT_RESET_MS   = 45 * 60 * 1000;
 const CHAT_WARN_MS    = 40 * 60 * 1000;
@@ -96,6 +114,7 @@ const WEBRTC_TIMEOUT  = 15000;  // 15s WebRTC connection timeout
 const HEARTBEAT_MS    = 5000;   // queue heartbeat check
 const SCORE_MIN       = 1.0;
 const SCORE_MAX       = 10.0;
+const MIN_SCAN_MS     = 2400;
 
 /* ════════════════════════════════
    TIER SYSTEM
@@ -269,7 +288,7 @@ wss.on('connection', (ws) => {
         user.username = (msg.username || '').slice(0, 24);
         user.photoURL = msg.photoURL || '';
 
-        if (msg.idToken && admin) {
+        if (msg.idToken) {
           // ── VERIFIED PATH: client sends Firebase ID token ──
           const decoded = await verifyToken(msg.idToken);
           if (decoded) {
@@ -290,18 +309,28 @@ wss.on('connection', (ws) => {
               user.winStreak   = fsData.winStreak   || 0;
               user.peakElo     = fsData.peakElo     || user.elo;
             }
+          } else if (msg.uid && !db) {
+            user.uid      = msg.uid;
+            user.verified = false;
+            user.elo      = Math.min(Math.max(parseInt(msg.elo)||400, 0), 10000);
+            user.wins     = parseInt(msg.wins)  || 0;
+            user.losses   = parseInt(msg.losses)|| 0;
+            user.winStreak = parseInt(msg.winStreak) || 0;
+            user.peakElo   = Math.max(parseInt(msg.peakElo)||user.elo, user.elo);
           } else {
             // Token invalid — treat as guest
             user.uid      = null;
             user.verified = false;
           }
-        } else if (msg.uid && !admin) {
+        } else if (msg.uid && !db) {
           // ── UNVERIFIED PATH (no Admin SDK): trust uid from client ──
           // This is less secure but works when Admin SDK not configured
           user.uid = msg.uid;
           user.elo = Math.min(Math.max(parseInt(msg.elo)||400, 0), 10000);
           user.wins   = parseInt(msg.wins)  || 0;
           user.losses = parseInt(msg.losses)|| 0;
+          user.winStreak = parseInt(msg.winStreak) || 0;
+          user.peakElo   = Math.max(parseInt(msg.peakElo)||user.elo, user.elo);
         }
 
         // Check ban
@@ -384,6 +413,14 @@ wss.on('connection', (ws) => {
           break;
         }
         if (match.scores[socketId] !== undefined) break; // no double submit
+        if (match.type !== 'private' && !match.rtcConnected) {
+          send(ws, { type:'score_error', error:'Camera link is still connecting' });
+          break;
+        }
+        if (Date.now() - (match.startedAt || Date.now()) < MIN_SCAN_MS) {
+          send(ws, { type:'score_error', error:'Scan is still calibrating' });
+          break;
+        }
 
         match.scores[socketId] = raw;
         if (Object.keys(match.scores).length === 2) {
@@ -474,7 +511,11 @@ wss.on('connection', (ws) => {
         const rematchOpp = msg.targetId ? users.get(msg.targetId) : null;
         if (!rematchOpp || !user.lastMatchId) break;
         user.wantsRematch = true;
+        if (user.rematchTimer) clearTimeout(user.rematchTimer);
+        user.rematchTimer = setTimeout(() => { user.wantsRematch = false; }, 10000);
         if (rematchOpp.wantsRematch && rematchOpp.lastOpponentId === socketId) {
+          if (user.rematchTimer) clearTimeout(user.rematchTimer);
+          if (rematchOpp.rematchTimer) clearTimeout(rematchOpp.rematchTimer);
           user.wantsRematch = false; rematchOpp.wantsRematch = false;
           send(user.ws,     { type:'rematch_ready' });
           send(rematchOpp.ws, { type:'rematch_ready' });
@@ -562,27 +603,17 @@ function tryMatch() {
 
     const waitMs = Date.now() - (u1.queuedAt || Date.now());
     const band   = ELO_BAND + Math.floor(waitMs / BAND_WIDEN_MS) * 200;
-    const pref   = u1.mmkPref || 'similar';
 
     for (let j = i+1; j < matchQueue.length; j++) {
       const id2 = matchQueue[j];
       const u2  = users.get(id2);
       if (!u2 || u2.ws.readyState !== WebSocket.OPEN) { matchQueue.splice(j,1); j--; continue; }
 
-      const eloDiff  = Math.abs(u1.elo - u2.elo);
       const longWait = waitMs > 120000 || (Date.now()-(u2.queuedAt||Date.now())) > 120000;
 
-      // Matchmaking preference logic
-      let eligible = false;
-      if (pref === 'anyone') {
-        eligible = true; // match anyone
-      } else if (pref === 'higher') {
-        // prefer opponent with higher ELO — still within 2x normal band, but bias toward higher
-        eligible = u2.elo >= u1.elo - 100 && eloDiff <= band * 2;
-      } else {
-        // 'similar' — standard ELO band
-        eligible = eloDiff <= band;
-      }
+      const u2WaitMs = Date.now() - (u2.queuedAt || Date.now());
+      const u2Band   = ELO_BAND + Math.floor(u2WaitMs / BAND_WIDEN_MS) * 200;
+      const eligible = preferenceAllows(u1, u2, band) && preferenceAllows(u2, u1, u2Band);
 
       if (eligible || longWait) {
         matchQueue.splice(j,1); matchQueue.splice(i,1);
@@ -594,12 +625,20 @@ function tryMatch() {
   }
 }
 
+function preferenceAllows(me, opponent, band) {
+  const pref = me.mmkPref || 'similar';
+  const eloDiff = Math.abs(me.elo - opponent.elo);
+  if (pref === 'anyone') return true;
+  if (pref === 'higher') return opponent.elo >= me.elo - 100 && eloDiff <= band * 2;
+  return eloDiff <= band;
+}
+
 function createMatch(id1, id2, u1, u2) {
   const matchId = uuidv4();
   const match   = { id:matchId, players:[id1,id2], scores:{}, type:'ranked', startedAt:Date.now(), rtcTimeout:null, rtcConnected:false };
   activeMatches.set(matchId, match);
-  u1.inQueue=false; u1.inMatch=true; u1.matchId=matchId;
-  u2.inQueue=false; u2.inMatch=true; u2.matchId=matchId;
+  u1.inQueue=false; u1.inMatch=true; u1.matchId=matchId; u1.lastOpponentId=id2;
+  u2.inQueue=false; u2.inMatch=true; u2.matchId=matchId; u2.lastOpponentId=id1;
   globalStats.totalMatches++;
 
   const p1prog = calcEloProgress(u1.elo);
@@ -684,6 +723,7 @@ app.get('/elo-progress/:elo', (req,res) => {
 
 /* ── ADMIN ── */
 function adminAuth(req,res) {
+  if (!ADMIN_KEY) { res.status(403).json({error:'Admin key is not configured'}); return false; }
   if (req.body?.adminKey !== ADMIN_KEY) { res.status(403).json({error:'Unauthorized'}); return false; }
   return true;
 }
