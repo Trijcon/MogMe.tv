@@ -280,11 +280,15 @@ wss.on('connection', (ws) => {
             // Fetch real stats from Firestore — client cannot fake these
             const fsData = await fetchUserFromFirestore(decoded.uid);
             if (fsData) {
-              user.elo      = fsData.elo      || 400;
-              user.wins     = fsData.wins     || 0;
-              user.losses   = fsData.losses   || 0;
-              user.username = fsData.username || user.username;
-              user.name     = fsData.username || user.name;
+              user.elo         = fsData.elo      || 400;
+              user.wins        = fsData.wins     || 0;
+              user.losses      = fsData.losses   || 0;
+              user.username    = fsData.username || user.username;
+              user.name        = fsData.username || user.name;
+              user.appealSum   = fsData.appealSum   || 0;
+              user.appealCount = fsData.appealCount || 0;
+              user.winStreak   = fsData.winStreak   || 0;
+              user.peakElo     = fsData.peakElo     || user.elo;
             }
           } else {
             // Token invalid — treat as guest
@@ -351,6 +355,7 @@ wss.on('connection', (ws) => {
         if (user.inQueue || user.inMatch) break;
         user.inQueue  = true;
         user.queuedAt = Date.now();
+        user.mmkPref  = msg.mmkPref || 'similar'; // 'similar' | 'higher' | 'anyone'
         matchQueue.push(socketId);
         send(ws, { type:'queue_joined', position:matchQueue.length });
         broadcast({ type:'queue_update', size:matchQueue.length });
@@ -557,6 +562,7 @@ function tryMatch() {
 
     const waitMs = Date.now() - (u1.queuedAt || Date.now());
     const band   = ELO_BAND + Math.floor(waitMs / BAND_WIDEN_MS) * 200;
+    const pref   = u1.mmkPref || 'similar';
 
     for (let j = i+1; j < matchQueue.length; j++) {
       const id2 = matchQueue[j];
@@ -566,7 +572,19 @@ function tryMatch() {
       const eloDiff  = Math.abs(u1.elo - u2.elo);
       const longWait = waitMs > 120000 || (Date.now()-(u2.queuedAt||Date.now())) > 120000;
 
-      if (eloDiff <= band || longWait) {
+      // Matchmaking preference logic
+      let eligible = false;
+      if (pref === 'anyone') {
+        eligible = true; // match anyone
+      } else if (pref === 'higher') {
+        // prefer opponent with higher ELO — still within 2x normal band, but bias toward higher
+        eligible = u2.elo >= u1.elo - 100 && eloDiff <= band * 2;
+      } else {
+        // 'similar' — standard ELO band
+        eligible = eloDiff <= band;
+      }
+
+      if (eligible || longWait) {
         matchQueue.splice(j,1); matchQueue.splice(i,1);
         createMatch(id1, id2, u1, u2);
         setTimeout(tryMatch, 100);
@@ -742,7 +760,13 @@ function broadcast(data, excludeId=null) {
 }
 function publicUser(u) {
   if (!u) return null;
-  return { id:u.id, name:u.username||u.name, username:u.username, uid:u.uid, photoURL:u.photoURL, elo:u.elo, wins:u.wins, losses:u.losses, tier:getTier(u.elo), verified:u.verified };
+  return {
+    id:u.id, name:u.username||u.name, username:u.username, uid:u.uid,
+    photoURL:u.photoURL, elo:u.elo, wins:u.wins, losses:u.losses,
+    tier:getTier(u.elo), verified:u.verified,
+    winStreak:u.winStreak||0, peakElo:u.peakElo||u.elo,
+    appealSum:u.appealSum||0, appealCount:u.appealCount||0,
+  };
 }
 function generateRoomCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
