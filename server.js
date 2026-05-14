@@ -5,8 +5,44 @@ const cors  = require('cors');
 const http  = require('http');
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+app.disable('x-powered-by');
+
+const DEFAULT_ALLOWED_ORIGINS = [
+  'https://mogme.tv',
+  'https://www.mogme.tv',
+  'http://localhost:5173',
+  'http://localhost:5174',
+  'http://127.0.0.1:5173',
+  'http://127.0.0.1:5174',
+];
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || DEFAULT_ALLOWED_ORIGINS.join(','))
+  .split(',')
+  .map(origin => origin.trim())
+  .filter(Boolean);
+const MAX_WS_BYTES = 64 * 1024;
+
+function isAllowedOrigin(origin) {
+  if (!origin) return true;
+  if (!ALLOWED_ORIGINS.length) return true;
+  return ALLOWED_ORIGINS.includes(origin);
+}
+
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Permissions-Policy', 'geolocation=(), payment=()');
+  next();
+});
+app.use(cors({
+  origin(origin, cb) {
+    cb(null, isAllowedOrigin(origin));
+  },
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Admin-Key'],
+  maxAge: 86400,
+}));
+app.use(express.json({ limit:'32kb' }));
 
 /* ════════════════════════════════
    RATE LIMITING — express-rate-limit
@@ -34,7 +70,7 @@ try {
 }
 
 const server = http.createServer(app);
-const wss    = new WebSocketServer({ server });
+const wss    = new WebSocketServer({ server, maxPayload:MAX_WS_BYTES });
 
 /* ════════════════════════════════
    FIREBASE ADMIN SDK
@@ -115,6 +151,36 @@ const HEARTBEAT_MS    = 5000;   // queue heartbeat check
 const SCORE_MIN       = 1.0;
 const SCORE_MAX       = 10.0;
 const MIN_SCAN_MS     = 2400;
+
+function cleanText(value, fallback = '', max = 200) {
+  return String(value ?? fallback)
+    .replace(/[\u0000-\u001f\u007f<>]/g, '')
+    .trim()
+    .slice(0, max) || fallback;
+}
+
+function cleanName(value, fallback = 'Anonymous') {
+  return cleanText(value, fallback, 24);
+}
+
+function cleanPhotoURL(value) {
+  try {
+    const parsed = new URL(String(value || ''));
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return '';
+    return parsed.href.slice(0, 512);
+  } catch {
+    return '';
+  }
+}
+
+function cleanMatchPreference(value) {
+  return ['similar', 'higher', 'anyone'].includes(value) ? value : 'similar';
+}
+
+function cleanRoomCode(value) {
+  const code = String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
+  return code.length === 6 ? code : '';
+}
 
 /* ════════════════════════════════
    TIER SYSTEM
@@ -251,7 +317,12 @@ setInterval(() => {
 /* ════════════════════════════════
    WEBSOCKET
 ════════════════════════════════ */
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
+  if (!isAllowedOrigin(req.headers.origin)) {
+    ws.close(1008, 'Origin not allowed');
+    return;
+  }
+
   const socketId = uuidv4();
   const user = {
     id:socketId, ws,
@@ -277,16 +348,20 @@ wss.on('connection', (ws) => {
   broadcastOnlineCount();
 
   ws.on('message', async (raw) => {
+    if (raw.length > MAX_WS_BYTES) {
+      ws.close(1009, 'Message too large');
+      return;
+    }
     let msg;
-    try { msg = JSON.parse(raw); } catch { return; }
+    try { msg = JSON.parse(raw.toString('utf8')); } catch { return; }
 
     switch(msg.type) {
 
       /* ── SET USER — verify JWT token ── */
       case 'set_user': {
-        user.name     = (msg.name     || 'Anonymous').slice(0, 24);
-        user.username = (msg.username || '').slice(0, 24);
-        user.photoURL = msg.photoURL || '';
+        user.name     = cleanName(msg.name);
+        user.username = cleanName(msg.username, '');
+        user.photoURL = cleanPhotoURL(msg.photoURL);
 
         if (msg.idToken) {
           // ── VERIFIED PATH: client sends Firebase ID token ──
@@ -302,15 +377,16 @@ wss.on('connection', (ws) => {
               user.elo         = fsData.elo      || 400;
               user.wins        = fsData.wins     || 0;
               user.losses      = fsData.losses   || 0;
-              user.username    = fsData.username || user.username;
-              user.name        = fsData.username || user.name;
+              user.username    = cleanName(fsData.username, user.username);
+              user.name        = cleanName(fsData.username, user.name);
+              user.photoURL    = cleanPhotoURL(fsData.photoURL || user.photoURL);
               user.appealSum   = fsData.appealSum   || 0;
               user.appealCount = fsData.appealCount || 0;
               user.winStreak   = fsData.winStreak   || 0;
               user.peakElo     = fsData.peakElo     || user.elo;
             }
           } else if (msg.uid && !db) {
-            user.uid      = msg.uid;
+            user.uid      = cleanText(msg.uid, '', 128);
             user.verified = false;
             user.elo      = Math.min(Math.max(parseInt(msg.elo)||400, 0), 10000);
             user.wins     = parseInt(msg.wins)  || 0;
@@ -325,7 +401,7 @@ wss.on('connection', (ws) => {
         } else if (msg.uid && !db) {
           // ── UNVERIFIED PATH (no Admin SDK): trust uid from client ──
           // This is less secure but works when Admin SDK not configured
-          user.uid = msg.uid;
+          user.uid = cleanText(msg.uid, '', 128);
           user.elo = Math.min(Math.max(parseInt(msg.elo)||400, 0), 10000);
           user.wins   = parseInt(msg.wins)  || 0;
           user.losses = parseInt(msg.losses)|| 0;
@@ -355,7 +431,8 @@ wss.on('connection', (ws) => {
           break;
         }
         if (bannedUsers.has(user.username.toLowerCase())) break;
-        if (!msg.text || !msg.text.trim()) break;
+        const cleanChatText = cleanText(msg.text, '', 200);
+        if (!cleanChatText) break;
 
         // Per-socket chat cooldown (1.5s)
         const now = Date.now();
@@ -369,7 +446,7 @@ wss.on('connection', (ws) => {
         const chatMsg = {
           id:uuidv4(), userId:socketId,
           name:user.username, photoURL:user.photoURL,
-          text:msg.text.slice(0, 200).trim(),
+          text:cleanChatText,
           elo:user.elo, tier:tier.name, tierEmoji:tier.emoji,
           timestamp:Date.now(),
         };
@@ -384,7 +461,7 @@ wss.on('connection', (ws) => {
         if (user.inQueue || user.inMatch) break;
         user.inQueue  = true;
         user.queuedAt = Date.now();
-        user.mmkPref  = msg.mmkPref || 'similar'; // 'similar' | 'higher' | 'anyone'
+        user.mmkPref  = cleanMatchPreference(msg.mmkPref); // 'similar' | 'higher' | 'anyone'
         matchQueue.push(socketId);
         send(ws, { type:'queue_joined', position:matchQueue.length });
         broadcast({ type:'queue_update', size:matchQueue.length });
@@ -451,16 +528,19 @@ wss.on('connection', (ws) => {
 
       /* ── WEBRTC SIGNALING ── */
       case 'webrtc_offer': {
+        if (!canSignalTo(user, msg.targetId)) break;
         const t = users.get(msg.targetId);
         if (t) send(t.ws, { type:'webrtc_offer', offer:msg.offer, fromId:socketId });
         break;
       }
       case 'webrtc_answer': {
+        if (!canSignalTo(user, msg.targetId)) break;
         const t = users.get(msg.targetId);
         if (t) send(t.ws, { type:'webrtc_answer', answer:msg.answer, fromId:socketId });
         break;
       }
       case 'webrtc_ice': {
+        if (!canSignalTo(user, msg.targetId)) break;
         const t = users.get(msg.targetId);
         if (t) send(t.ws, { type:'webrtc_ice', candidate:msg.candidate, fromId:socketId });
         break;
@@ -488,7 +568,7 @@ wss.on('connection', (ws) => {
         break;
       }
       case 'join_private_room': {
-        const code = (msg.code||'').toUpperCase().trim();
+        const code = cleanRoomCode(msg.code);
         const room  = privateRooms.get(code);
         if (!room)               { send(ws,{type:'room_error',error:'Invalid or expired code'}); break; }
         if (room.host===socketId){ send(ws,{type:'room_error',error:'Cannot join your own room'}); break; }
@@ -531,10 +611,13 @@ wss.on('connection', (ws) => {
         break;
       }
 
-      case 'report_user':
+      case 'report_user': {
+        msg.targetId = cleanText(msg.targetId, '', 80);
+        msg.reason = cleanText(msg.reason, 'unspecified', 120);
         console.log(`[REPORT] ${user.username} → ${msg.targetId}: ${msg.reason}`);
         send(ws, { type:'report_received' });
         break;
+      }
 
       case 'ping':
         send(ws, { type:'pong', timestamp:Date.now() });
@@ -724,13 +807,14 @@ app.get('/elo-progress/:elo', (req,res) => {
 /* ── ADMIN ── */
 function adminAuth(req,res) {
   if (!ADMIN_KEY) { res.status(403).json({error:'Admin key is not configured'}); return false; }
-  if (req.body?.adminKey !== ADMIN_KEY) { res.status(403).json({error:'Unauthorized'}); return false; }
+  const suppliedKey = req.get('X-Admin-Key') || req.body?.adminKey;
+  if (suppliedKey !== ADMIN_KEY) { res.status(403).json({error:'Unauthorized'}); return false; }
   return true;
 }
 
 app.post('/admin/broadcast', (req,res) => {
   if (!adminAuth(req,res)) return;
-  const message = req.body?.message;
+  const message = cleanText(req.body?.message, '', 500);
   if (!message) { res.status(400).json({error:'No message'}); return; }
   const m = makeSysMsg('📢 '+message);
   chatHistory.push(m);
@@ -749,11 +833,11 @@ app.post('/admin/reset-chat', (req,res) => {
 
 app.post('/admin/ban', (req,res) => {
   if (!adminAuth(req,res)) return;
-  const { username } = req.body;
+  const username = cleanName(req.body?.username, '').toLowerCase();
   if (!username) { res.status(400).json({error:'No username'}); return; }
-  bannedUsers.add(username.toLowerCase());
+  bannedUsers.add(username);
   users.forEach(u => {
-    if (u.username?.toLowerCase()===username.toLowerCase()) {
+    if (u.username?.toLowerCase()===username) {
       send(u.ws,{type:'banned',message:'You have been banned.'});
       u.ws.close();
     }
@@ -763,7 +847,7 @@ app.post('/admin/ban', (req,res) => {
 
 app.post('/admin/unban', (req,res) => {
   if (!adminAuth(req,res)) return;
-  bannedUsers.delete((req.body?.username||'').toLowerCase());
+  bannedUsers.delete(cleanName(req.body?.username, '').toLowerCase());
   res.json({ ok:true });
 });
 
@@ -788,6 +872,13 @@ app.post('/admin/clear-override', (req,res) => {
 function getDisplayOnline() {
   return globalStats.onlineOverride != null ? globalStats.onlineOverride : users.size;
 }
+function canSignalTo(user, targetId) {
+  if (!user || !targetId || !user.matchId) return false;
+  const target = users.get(targetId);
+  if (!target || target.matchId !== user.matchId) return false;
+  const match = activeMatches.get(user.matchId);
+  return !!match && match.players.includes(user.id) && match.players.includes(targetId);
+}
 function broadcastOnlineCount() {
   broadcast({ type:'online_count', count:getDisplayOnline() });
 }
@@ -801,11 +892,11 @@ function broadcast(data, excludeId=null) {
 function publicUser(u) {
   if (!u) return null;
   return {
-    id:u.id, name:u.username||u.name, username:u.username, uid:u.uid,
-    photoURL:u.photoURL, elo:u.elo, wins:u.wins, losses:u.losses,
-    tier:getTier(u.elo), verified:u.verified,
-    winStreak:u.winStreak||0, peakElo:u.peakElo||u.elo,
-    appealSum:u.appealSum||0, appealCount:u.appealCount||0,
+    id:u.id, name:cleanName(u.username||u.name), username:cleanName(u.username, ''),
+    photoURL:cleanPhotoURL(u.photoURL), elo:Number(u.elo)||400, wins:Number(u.wins)||0, losses:Number(u.losses)||0,
+    tier:getTier(Number(u.elo)||400), verified:u.verified,
+    winStreak:Number(u.winStreak)||0, peakElo:Number(u.peakElo)||Number(u.elo)||400,
+    appealSum:Number(u.appealSum)||0, appealCount:Number(u.appealCount)||0,
   };
 }
 function generateRoomCode() {
