@@ -1,7 +1,7 @@
 {
-  "name": "omoggle-server",
+  "name": "mogme-tv-server",
   "version": "1.0.0",
-  "description": "OMOGGLE real-time server",
+  "description": "MogMe.TV real-time server",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
