@@ -787,6 +787,29 @@ async function resolveMatch(match) {
   }
 
   await Promise.all([settle(u1,s1,s2,u2), settle(u2,s2,s1,u1)]);
+
+  // Broadcast to all connected clients so the home Activity feed updates live.
+  // Skip private/unranked matches.
+  if (match.type !== 'private') {
+    const winnerWon = s1 > s2;
+    const winnerU = winnerWon ? u1 : u2;
+    const loserU  = winnerWon ? u2 : u1;
+    if (winnerU && loserU) {
+      const winName = cleanName(winnerU.username || winnerU.name, 'Anonymous');
+      const losName = cleanName(loserU.username  || loserU.name,  'Anonymous');
+      // calculate the winner's eloChange for display
+      const eloChg = Math.abs(calcEloChange(true, loserU.elo, winnerU.elo));
+      broadcast({
+        type: 'activity',
+        winner: winName,
+        loser:  losName,
+        eloChange: eloChg,
+        winnerTier: getTier(winnerU.elo).name,
+        timestamp: Date.now(),
+      });
+    }
+  }
+
   activeMatches.delete(match.id);
   console.log(`[RESULT] ${s1.toFixed(1)} vs ${s2.toFixed(1)}`);
 }
@@ -802,6 +825,63 @@ app.get('/elo-progress/:elo', (req,res) => {
   const elo = parseInt(req.params.elo);
   if (isNaN(elo)) { res.status(400).json({ error:'Invalid ELO' }); return; }
   res.json(calcEloProgress(elo));
+});
+
+/* ════════════════════════════════
+   LIVENESS GATE — 4-stage check
+   Client posts here after passing
+   the in-browser challenge. Server
+   records timestamp on the user's
+   Firestore doc so it persists
+   across devices/sessions.
+   3-hour validity.
+════════════════════════════════ */
+const LIVENESS_TTL_MS = 3 * 60 * 60 * 1000;
+
+async function authBearer(req) {
+  const h = req.headers && req.headers['authorization'];
+  if (!h) return null;
+  const m = /^Bearer\s+(.+)$/i.exec(String(h));
+  if (!m) return null;
+  return await verifyToken(m[1]);
+}
+
+app.post('/liveness/pass', async (req, res) => {
+  const user = await authBearer(req);
+  if (!user) return res.status(401).json({ error: 'unauthorized' });
+  if (!db)   return res.status(503).json({ error: 'firestore unavailable' });
+  try {
+    await db.collection('users').doc(user.uid).set(
+      { livenessLastPassedAt: new Date() },
+      { merge: true }
+    );
+    res.json({ ok: true, passedAt: Date.now() });
+  } catch (e) {
+    console.warn('[Liveness] pass write failed:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/liveness/status', async (req, res) => {
+  const user = await authBearer(req);
+  if (!user) return res.status(401).json({ error: 'unauthorized' });
+  if (!db)   return res.json({ valid: false, reason: 'no_firestore' });
+  try {
+    const snap = await db.collection('users').doc(user.uid).get();
+    const data = snap.exists ? snap.data() : {};
+    const raw  = data && data.livenessLastPassedAt;
+    const passedMs = raw && raw.toMillis ? raw.toMillis()
+                  : raw ? new Date(raw).getTime() : 0;
+    const valid = passedMs > 0 && (Date.now() - passedMs) < LIVENESS_TTL_MS;
+    res.json({
+      valid,
+      passedAt: passedMs,
+      expiresAt: passedMs ? passedMs + LIVENESS_TTL_MS : 0,
+    });
+  } catch (e) {
+    console.warn('[Liveness] status read failed:', e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 /* ── ADMIN ── */
